@@ -1,0 +1,16 @@
+# Mini Code 依赖
+# 使用: pip install -r requirements.txt
+
+# ── LLM SDK ──────────────────────────────
+anthropic>=0.25.0          # Anthropic Claude API
+openai>=1.0.0              # OpenAI / 兼容 API
+
+# ── 工具 ─────────────────────────────────
+python-dotenv              # .env 文件加载
+tqdm                       # 进度条（后续迭代备用）
+
+# ── 终端 UI ─────────────────────────────
+rich>=13.0.0              # 富文本终端输出
+
+# ── 终端 UI ─────────────────────────────
+rich>=13.0.0              # 富文本终端输出
