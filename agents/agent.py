@@ -3,42 +3,47 @@ agent.py — Agent 主循环
 
 核心功能：
   - Agent 类，封装模型调用（OpenAI / Anthropic 双协议）
-  - chat(user_message) 主方法
+  - chat(user_message) 主方法，支持多轮工具调用循环
+  - 工具调用解析、权限检查、执行、结果回写
   - 指数退避重试（429 / 503 / 529）
   - 上下文窗口常量表
   - clear_history() / show_cost()
 """
 
 import os
+import json
 import time
 from typing import Optional
+
+from agents.tools import (
+    execute_tool,
+    check_permission,
+    get_active_tool_definitions,
+    PermissionMode,
+)
+from agents.ui import (
+    print_tool_call,
+    print_tool_result,
+    print_info,
+    stop_spinner,
+)
 
 # ── 模型上下文窗口常量表 ──────────────────────────────────────
 # (model_prefix, context_window, input_price_per_1M, output_price_per_1M)
 # 价格单位：美元 / 百万 token
-# Qwen 系列原始价格单位为 RMB（~7 RMB/USD），此处已折算为 USD
 MODEL_REGISTRY: list[tuple[str, int, float, float]] = [
     # ── 阿里云百炼 DashScope（通义千问 Qwen）──
-    # Qwen3.8-Max
     ("qwen3.8-max", 131072, 1.71, 5.14),
     ("qwen3.8-flash", 131072, 0.11, 0.39),
-    # Qwen3.7-Max
     ("qwen3.7-max", 131072, 1.71, 5.14),
     ("qwen3.7-plus", 131072, 0.30, 0.70),
     ("qwen3.7-flash", 131072, 0.02, 0.05),
-    # Qwen-Max（旧版）
     ("qwen-max", 32768, 2.00, 6.00),
-    # Qwen-Plus
     ("qwen-plus", 131072, 0.50, 2.00),
-    # Qwen-Turbo
     ("qwen-turbo", 131072, 0.30, 0.60),
-    # QwQ-Plus（推理专用）
     ("qwq-plus", 131072, 0.23, 0.57),
-    # Qwen-Coder-Plus
     ("qwen-coder-plus", 131072, 0.50, 1.00),
-    # Qwen-Long（长文本）
     ("qwen-long", 10000000, 0.07, 0.29),
-    # 通义千问旧版兜底
     ("qwen", 131072, 0.50, 2.00),
     # ── Anthropic Claude ──
     ("claude-opus-5", 200000, 15.00, 75.00),
@@ -76,12 +81,8 @@ TOOL_ROLE = "tool"
 
 
 def _lookup_model(model_name: str) -> tuple[int, float, float]:
-    """查找模型的上下文窗口和价格，未匹配则返回 default
-
-    按前缀长度降序匹配，确保 "gpt-4o-mini" 优先于 "gpt-4o"。
-    """
+    """查找模型的上下文窗口和价格，未匹配则返回 default"""
     lower = model_name.lower()
-    # 按前缀长度降序排序，避免 "gpt-4o" 吃掉 "gpt-4o-mini"
     sorted_registry = sorted(
         [r for r in MODEL_REGISTRY if r[0] != "default"],
         key=lambda r: len(r[0]),
@@ -90,7 +91,6 @@ def _lookup_model(model_name: str) -> tuple[int, float, float]:
     for prefix, ctx, inp, out in sorted_registry:
         if lower.startswith(prefix):
             return ctx, inp, out
-    # fallback to default
     for prefix, ctx, inp, out in MODEL_REGISTRY:
         if prefix == "default":
             return ctx, inp, out
@@ -121,6 +121,7 @@ class Agent:
         max_turns: int = 50,
         max_cost: Optional[float] = None,
         system_prompt: Optional[str] = None,
+        permission_mode: PermissionMode = PermissionMode.DEFAULT,
     ):
         self.model = model
         self.api_key = api_key or os.environ.get("API_KEY", "")
@@ -128,6 +129,7 @@ class Agent:
         self.max_turns = max_turns
         self.max_cost = max_cost
         self.system_prompt = system_prompt or "You are Mini Code, a helpful AI assistant."
+        self.permission_mode = permission_mode
 
         # 对话历史
         self.messages: list[dict] = []
@@ -157,9 +159,7 @@ class Agent:
         try:
             from openai import OpenAI
         except ImportError:
-            raise ImportError(
-                "需要安装 openai SDK: pip install openai>=1.0.0"
-            )
+            raise ImportError("需要安装 openai SDK: pip install openai>=1.0.0")
         self._openai_client = OpenAI(api_key=self.api_key, base_url=self.api_base)
         self._openai_client_kwargs: dict = {}
 
@@ -168,9 +168,7 @@ class Agent:
         try:
             import anthropic
         except ImportError:
-            raise ImportError(
-                "需要安装 anthropic SDK: pip install anthropic>=0.25.0"
-            )
+            raise ImportError("需要安装 anthropic SDK: pip install anthropic>=0.25.0")
         self._anthropic_client = anthropic.Anthropic(
             api_key=self.api_key,
             base_url=self.api_base,
@@ -180,26 +178,65 @@ class Agent:
     # ── 公共方法 ──────────────────────────────────────────
 
     def chat(self, user_message: str) -> str:
-        """主方法：发送用户消息并返回助手回复"""
-        # 添加用户消息
+        """主方法：发送用户消息，支持多轮工具调用循环"""
         self.messages.append({"role": USER_ROLE, "content": user_message})
 
-        # 调用模型（含自动重试）
-        reply_content = self._call_with_retry()
+        MAX_TOOL_TURNS = 10
+        for turn in range(MAX_TOOL_TURNS):
+            # 调用模型获取回复
+            response = self._call_with_retry()
 
-        # 添加助手回复
-        if reply_content is not None:
-            self.messages.append({"role": ASSISTANT_ROLE, "content": reply_content})
+            # 解析工具调用
+            if self.is_anthropic:
+                tool_calls, text = self._parse_anthropic_tool_calls(response)
+                assistant_msg = self._build_anthropic_assistant_msg(tool_calls, text)
+            else:
+                tool_calls, text = self._parse_openai_tool_calls(response)
+                assistant_msg = self._build_openai_assistant_msg(tool_calls, text)
 
-            # 成本检查
-            if self.max_cost is not None:
-                cost = self.show_cost(raw=True)
-                if cost > self.max_cost:
-                    raise RuntimeError(
-                        f"费用已达上限 ${cost:.4f} (max_cost=${self.max_cost:.4f})"
+            # 添加助手消息到历史
+            self.messages.append(assistant_msg)
+
+            # 纯文本回复 → 结束
+            if not tool_calls:
+                return text
+
+            # ── 处理工具调用 ──
+            stop_spinner()
+
+            for tc in tool_calls:
+                tc_name = tc["name"]
+                tc_args = tc["args"]
+
+                # 显示工具调用
+                print_tool_call(tc_name, tc_args)
+
+                # 权限检查
+                perm = check_permission(tc_name, self.permission_mode)
+
+                if perm == "deny":
+                    result = (
+                        f"<tool-error>Permission denied: {tc_name} "
+                        f"(mode={self.permission_mode.value})</tool-error>"
                     )
+                    print_tool_result(result)
+                elif perm == "ask":
+                    approved = self._prompt_user_approval(tc_name)
+                    if not approved:
+                        result = f"<tool-error>Permission denied by user: {tc_name}</tool-error>"
+                    else:
+                        result = execute_tool(tc_name, tc_args)
+                    print_tool_result(result)
+                else:  # allow
+                    result = execute_tool(tc_name, tc_args)
+                    print_tool_result(result)
 
-        return reply_content or ""
+                # 工具结果回写消息历史
+                self._add_tool_result(tc, result)
+
+            # 继续下一轮，让模型处理工具结果
+
+        return f"Reached maximum tool call turns ({MAX_TOOL_TURNS})."
 
     def clear_history(self) -> None:
         """清空对话历史"""
@@ -212,11 +249,7 @@ class Agent:
         input_cost = (self.total_input_tokens / 1_000_000) * self.input_price
         output_cost = (self.total_output_tokens / 1_000_000) * self.output_price
         total = input_cost + output_cost
-
-        if raw:
-            return total
-
-        return total
+        return total if raw else total
 
     def get_cost_string(self) -> str:
         """返回格式化费用字符串"""
@@ -232,8 +265,8 @@ class Agent:
 
     # ── 内部方法 ──────────────────────────────────────────
 
-    def _call_with_retry(self, max_retries: int = 5) -> Optional[str]:
-        """调用模型，带指数退避重试"""
+    def _call_with_retry(self, max_retries: int = 5):
+        """调用模型，带指数退避重试，返回完整 response 对象"""
         last_error: Optional[Exception] = None
 
         for attempt in range(1, max_retries + 1):
@@ -246,15 +279,12 @@ class Agent:
                 last_error = e
                 status_code = self._extract_status_code(e)
 
-                # 只在 429 / 503 / 529 且还有重试次数时重试
                 if status_code in (429, 503, 529) and attempt < max_retries:
                     delay = _exponential_backoff(attempt)
                     time.sleep(delay)
                     continue
 
-                # 其他错误 或 重试全部耗尽 → 直接抛出
                 if status_code in (429, 503, 529):
-                    # 重试耗尽，抛出 RuntimeError
                     raise RuntimeError(
                         f"模型调用失败（{max_retries} 次重试后）: {last_error}"
                     ) from last_error
@@ -268,32 +298,46 @@ class Agent:
                 return int(code_str)
         return 0
 
-    def _call_openai(self) -> str:
-        """使用 OpenAI-compatible API 调用"""
+    # ── API 调用方法 ───────────────────────────────────────
+
+    def _call_openai(self):
+        """使用 OpenAI-compatible API 调用，返回完整 response"""
         messages = self._build_openai_messages()
 
-        response = self._openai_client.chat.completions.create(
+        # 构建 tools 参数
+        tools = []
+        for t in get_active_tool_definitions():
+            tools.append({
+                "type": "function",
+                "function": {
+                    "name": t["name"],
+                    "description": t["description"],
+                    "parameters": t["input_schema"],
+                },
+            })
+
+        kwargs = dict(
             model=self.model,
             messages=messages,
             **self._openai_client_kwargs,
         )
+        if tools:
+            kwargs["tools"] = tools
+
+        response = self._openai_client.chat.completions.create(**kwargs)
 
         # Token 统计
         if response.usage:
             self.total_input_tokens += response.usage.prompt_tokens or 0
             self.total_output_tokens += response.usage.completion_tokens or 0
 
-        # 取回复内容
-        choice = response.choices[0]
-        if choice.message.content:
-            return choice.message.content
-        return ""
+        return response
 
-    def _call_anthropic(self) -> str:
-        """使用 Anthropic API 调用"""
-        import anthropic
-
+    def _call_anthropic(self):
+        """使用 Anthropic API 调用，返回完整 response"""
         system_msg, messages = self._build_anthropic_messages()
+
+        tools = get_active_tool_definitions()
 
         kwargs: dict = dict(
             model=self.model,
@@ -302,6 +346,8 @@ class Agent:
         )
         if system_msg:
             kwargs["system"] = system_msg
+        if tools:
+            kwargs["tools"] = tools
 
         response = self._anthropic_client.messages.create(**kwargs)
 
@@ -310,19 +356,121 @@ class Agent:
             self.total_input_tokens += response.usage.input_tokens or 0
             self.total_output_tokens += response.usage.output_tokens or 0
 
-        # 取回复内容
-        content_parts = []
+        return response
+
+    # ── 工具调用解析 ───────────────────────────────────────
+
+    def _parse_openai_tool_calls(self, response) -> tuple[list[dict], str]:
+        """从 OpenAI response 解析 tool_calls，返回 (tool_calls, text)"""
+        message = response.choices[0].message
+        tool_calls = []
+        text = message.content or ""
+
+        if message.tool_calls:
+            for tc in message.tool_calls:
+                try:
+                    args = json.loads(tc.function.arguments)
+                except json.JSONDecodeError:
+                    args = {"_raw_args": tc.function.arguments}
+                tool_calls.append({
+                    "id": tc.id,
+                    "name": tc.function.name,
+                    "args": args,
+                })
+
+        return tool_calls, text
+
+    def _parse_anthropic_tool_calls(self, response) -> tuple[list[dict], str]:
+        """从 Anthropic response 解析 tool_use，返回 (tool_calls, text)"""
+        tool_calls = []
+        text_parts = []
+
         for block in response.content:
-            if block.type == "text":
-                content_parts.append(block.text)
-        return "\n".join(content_parts)
+            if block.type == "tool_use":
+                tool_calls.append({
+                    "id": block.id,
+                    "name": block.name,
+                    "args": dict(block.input),
+                })
+            elif block.type == "text":
+                text_parts.append(block.text)
+
+        return tool_calls, "\n".join(text_parts)
+
+    # ── 消息构建 ──────────────────────────────────────────
+
+    def _build_openai_assistant_msg(self, tool_calls: list[dict], text: str) -> dict:
+        """构建 OpenAI 格式的助手消息（含 tool_calls）"""
+        msg: dict = {"role": "assistant", "content": text}
+        if tool_calls:
+            msg["tool_calls"] = [
+                {
+                    "id": tc["id"],
+                    "type": "function",
+                    "function": {
+                        "name": tc["name"],
+                        "arguments": json.dumps(tc["args"]),
+                    },
+                }
+                for tc in tool_calls
+            ]
+        return msg
+
+    def _build_anthropic_assistant_msg(self, tool_calls: list[dict], text: str) -> dict:
+        """构建 Anthropic 格式的助手消息（含 tool_use blocks）"""
+        content: list[dict] = []
+        if text:
+            content.append({"type": "text", "text": text})
+        for tc in tool_calls:
+            content.append({
+                "type": "tool_use",
+                "id": tc["id"],
+                "name": tc["name"],
+                "input": tc["args"],
+            })
+        return {"role": "assistant", "content": content}
+
+    # ── 工具结果回写 ───────────────────────────────────────
+
+    def _add_tool_result(self, tc: dict, result: str) -> None:
+        """将工具执行结果添加到消息历史（双协议适配）"""
+        if self.is_anthropic:
+            # Anthropic 要求 tool_result 放在 user role 的 content block 中
+            self.messages.append({
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tc["id"],
+                        "content": result,
+                    }
+                ],
+            })
+        else:
+            # OpenAI 使用 tool role
+            self.messages.append({
+                "role": "tool",
+                "tool_call_id": tc["id"],
+                "content": result,
+            })
+
+    # ── 用户权限确认 ───────────────────────────────────────
+
+    def _prompt_user_approval(self, tool_name: str) -> bool:
+        """向用户询问是否允许工具调用"""
+        try:
+            stop_spinner()
+            response = input(f"  Allow {tool_name}? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return False
+        return response in ("y", "yes")
+
+    # ── 消息格式化 ────────────────────────────────────────
 
     def _build_openai_messages(self) -> list[dict]:
         """构建 OpenAI 格式的 messages 列表"""
         msgs: list[dict] = []
-        # System prompt
         msgs.append({"role": SYSTEM_ROLE, "content": self.system_prompt})
-        # 对话历史
         msgs.extend(self.messages)
         return msgs
 
@@ -338,7 +486,9 @@ class Agent:
             elif role == USER_ROLE:
                 msgs.append({"role": "user", "content": msg["content"]})
             elif role == ASSISTANT_ROLE:
-                msgs.append({"role": "assistant", "content": msg["content"]})
+                # 保留 tool_calls 字段（Anthropic 将其编码为 content blocks）
+                assistant_entry: dict = {"role": "assistant", "content": msg["content"]}
+                msgs.append(assistant_entry)
 
         # 如果没有用户消息，加一个占位
         if not msgs:

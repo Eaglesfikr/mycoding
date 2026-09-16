@@ -23,6 +23,7 @@ from typing import Optional
 from dotenv import load_dotenv
 
 from agents.agent import Agent
+from agents.tools import PermissionMode
 from agents.ui import (
     print_welcome,
     print_goodbye,
@@ -251,18 +252,21 @@ def create_agent(args: argparse.Namespace) -> Agent:
     max_turns = args.max_turns or 50
     max_cost = args.max_cost
 
-    # 构建 system prompt（后续迭代会替换为 prompt.py 的 build_system_prompt）
-    system_parts = ["You are Mini Code, a self-evolving AI coding assistant."]
-
-    if args.plan:
-        system_parts.append("You are in plan mode. Read-only: you can read files and search, "
-                            "but cannot edit files or run shell commands.")
+    # 确定权限模式
     if args.yolo:
-        system_parts.append("YOLO mode: all tools are automatically approved.")
-    if args.accept_edits:
-        system_parts.append("Accept-edits mode: file edits are automatically approved.")
-    if args.dont_ask:
-        system_parts.append("Dont-ask mode: all tool calls are automatically rejected.")
+        perm_mode = PermissionMode.BYPASS
+    elif args.plan:
+        perm_mode = PermissionMode.PLAN
+    elif args.accept_edits:
+        perm_mode = PermissionMode.ACCEPT_EDITS
+    elif args.dont_ask:
+        perm_mode = PermissionMode.DONT_ASK
+    else:
+        perm_mode = PermissionMode.DEFAULT
+
+    # 构建基础 system prompt
+    system_prompt = "You are Mini Code, a self-evolving AI coding assistant. " \
+                    "You have access to tools. Use them when appropriate."
 
     return Agent(
         model=model,
@@ -270,7 +274,8 @@ def create_agent(args: argparse.Namespace) -> Agent:
         api_base=api_base,
         max_turns=max_turns,
         max_cost=max_cost,
-        system_prompt="\n".join(system_parts),
+        system_prompt=system_prompt,
+        permission_mode=perm_mode,
     )
 
 
